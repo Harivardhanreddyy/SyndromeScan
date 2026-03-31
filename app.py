@@ -1,217 +1,219 @@
-from flask import Flask,render_template,redirect,request,url_for, send_file
-import mysql.connector
-from keras.models import load_model
-from joblib import load
-import numpy as np
-from keras.preprocessing.text import Tokenizer
-from keras.preprocessing.sequence import pad_sequences
-import re
-import joblib
-from sklearn.ensemble import StackingClassifier
-import pandas as pd
-from sklearn.model_selection import train_test_split
-import collections
-import sys
-from flask import Flask, request, render_template, redirect, url_for
+from __future__ import annotations
+
 import os
-import joblib
-import numpy as np
-from tensorflow.keras.preprocessing.image import load_img, img_to_array
-from tensorflow.keras.applications.mobilenet import preprocess_input
-from tensorflow.keras.models import load_model
-from werkzeug.utils import secure_filename
-from flask import Flask, request, render_template, redirect, url_for
-import os
-import joblib
-import numpy as np
-from tensorflow.keras.preprocessing.image import load_img, img_to_array
-from tensorflow.keras.applications.mobilenet import preprocess_input, MobileNet
-from tensorflow.keras.applications.vgg16 import VGG16
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Flatten
+import sqlite3
+from pathlib import Path
+from typing import Optional
+
+from flask import Flask, redirect, render_template, request, url_for
 from werkzeug.utils import secure_filename
 
-# Compatibility for Python 3.10+
-if sys.version_info >= (3, 10):
-    collections.Hashable = collections.abc.Hashable
-
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "syndrome.db"
+UPLOAD_FOLDER = BASE_DIR / "static" / "uploads"
 
 app = Flask(__name__)
-
-mydb = mysql.connector.connect(
-    host="localhost",
-    user="root",
-    password="",
-    port="3306",
-    database='syndrome'
-)
-
-mycursor = mydb.cursor()
-
-def executionquery(query,values):
-    mycursor.execute(query,values)
-    mydb.commit()
-    return
-
-def retrivequery1(query,values):
-    mycursor.execute(query,values)
-    data = mycursor.fetchall()
-    return data
-
-def retrivequery2(query):
-    mycursor.execute(query)
-    data = mycursor.fetchall()
-    return data
+app.config["UPLOAD_FOLDER"] = str(UPLOAD_FOLDER)
+UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
 
 
-@app.route('/')
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with get_db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL
+            )
+            """
+        )
+
+
+class Predictor:
+    def __init__(self) -> None:
+        self.model_error: Optional[str] = None
+        self.logistic_vgg16 = None
+        self.lgbm_vgg16 = None
+        self.nmf_vgg16 = None
+        self.vgg_feature_extractor = None
+        self._keras = None
+        self._np = None
+        self._load_models()
+
+    def _load_models(self) -> None:
+        """
+        Load ML dependencies lazily so the web app can still run even when
+        inference packages/artifacts are unavailable in the host environment.
+        """
+        try:
+            import joblib
+            import numpy as np
+            from tensorflow.keras.applications.vgg16 import VGG16
+            from tensorflow.keras.layers import Flatten
+            from tensorflow.keras.models import Model
+
+            self._np = np
+            self._keras = {
+                "preprocess_input": __import__(
+                    "tensorflow.keras.applications.vgg16", fromlist=["preprocess_input"]
+                ).preprocess_input,
+                "load_img": __import__(
+                    "tensorflow.keras.preprocessing.image", fromlist=["load_img"]
+                ).load_img,
+                "img_to_array": __import__(
+                    "tensorflow.keras.preprocessing.image", fromlist=["img_to_array"]
+                ).img_to_array,
+            }
+
+            self.logistic_vgg16 = joblib.load(BASE_DIR / "logistic_vgg16.joblib")
+            self.lgbm_vgg16 = joblib.load(BASE_DIR / "lgbm_vgg16.joblib")
+            self.nmf_vgg16 = joblib.load(BASE_DIR / "nmf_vgg16.joblib")
+
+            vgg16_base = VGG16(weights="imagenet", include_top=False, input_shape=(224, 224, 3))
+            self.vgg_feature_extractor = Model(
+                inputs=vgg16_base.input,
+                outputs=Flatten()(vgg16_base.output),
+            )
+        except Exception as exc:
+            self.model_error = str(exc)
+
+    def predict_vnl_net(self, image_path: Path) -> str:
+        if self.model_error:
+            return f"Prediction unavailable: {self.model_error}"
+
+        load_img = self._keras["load_img"]
+        img_to_array = self._keras["img_to_array"]
+        preprocess_input = self._keras["preprocess_input"]
+        np = self._np
+
+        img = load_img(image_path, target_size=(224, 224))
+        img_array = img_to_array(img)
+        img_array = np.expand_dims(img_array, axis=0)
+        img_array = preprocess_input(img_array)
+
+        vgg_features = self.vgg_feature_extractor.predict(img_array, verbose=0)
+        nmf_features = self.nmf_vgg16.transform(vgg_features)
+        enhanced_features = self.lgbm_vgg16.predict_proba(nmf_features)[:, 1].reshape(-1, 1)
+        pred = self.logistic_vgg16.predict(enhanced_features)
+
+        return "Normal Kid" if int(pred[0]) == 1 else "Has Down Syndrome"
+
+
+predictor = Predictor()
+init_db()
+
+
+@app.route("/")
 def index():
+    return render_template("index.html")
 
-    return render_template('index.html')
 
-@app.route('/about')
+@app.route("/about")
 def about():
+    return render_template("about.html")
 
-    return render_template('about.html')
 
-
-@app.route('/register', methods=["GET", "POST"])
+@app.route("/register", methods=["GET", "POST"])
 def register():
     if request.method == "POST":
-        name = request.form['name']
-        email = request.form['email']
-        password = request.form['password']
-        c_password = request.form['c_password']
-        if password == c_password:
-            query = "SELECT UPPER(email) FROM users"
-            email_data = retrivequery2(query)
-            email_data_list = []
-            for i in email_data:
-                email_data_list.append(i[0])
-            if email.upper() not in email_data_list:
-                query = "INSERT INTO users (name, email, password) VALUES (%s, %s, %s)"
-                values = (name, email, password)
-                executionquery(query, values)
-                return render_template('login.html', message="Successfully Registered! Please go to login section")
-            return render_template('register.html', message="This email ID is already exists!")
-        return render_template('register.html', message="Confirm password is not match!")
-    return render_template('register.html')
+        name = request.form["name"].strip()
+        email = request.form["email"].strip().lower()
+        password = request.form["password"]
+        c_password = request.form["c_password"]
+
+        if password != c_password:
+            return render_template("register.html", message="Passwords do not match.")
+
+        with get_db() as conn:
+            exists = conn.execute("SELECT 1 FROM users WHERE email = ?", (email,)).fetchone()
+            if exists:
+                return render_template("register.html", message="Email already exists.")
+
+            conn.execute(
+                "INSERT INTO users (name, email, password) VALUES (?, ?, ?)",
+                (name, email, password),
+            )
+
+        return render_template("login.html", message="Registered successfully. Please log in.")
+
+    return render_template("register.html")
 
 
-@app.route('/login', methods=["GET", "POST"])
+@app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        email = request.form['email']
-        password = request.form['password']
-        
-        query = "SELECT UPPER(email) FROM users"
-        email_data = retrivequery2(query)
-        email_data_list = []
-        for i in email_data:
-            email_data_list.append(i[0])
+        email = request.form["email"].strip().lower()
+        password = request.form["password"]
 
-        if email.upper() in email_data_list:
-            query = "SELECT UPPER(password) FROM users WHERE email = %s"
-            values = (email,)
-            password__data = retrivequery1(query, values)
-            if password.upper() == password__data[0][0]:
-                global user_email
-                user_email = email
+        with get_db() as conn:
+            user = conn.execute(
+                "SELECT id, email FROM users WHERE email = ? AND password = ?",
+                (email, password),
+            ).fetchone()
 
-                return redirect("/home")
-            return render_template('login.html', message= "Invalid Password!!")
-        return render_template('login.html', message= "This email ID does not exist!")
-    return render_template('login.html')
+        if user:
+            return redirect(url_for("home"))
+
+        return render_template("login.html", message="Invalid email or password.")
+
+    return render_template("login.html")
 
 
-@app.route('/home')
+@app.route("/home")
 def home():
-    
-    return render_template('home.html')
+    return render_template("home.html")
 
 
-# Load the pre-trained models
-logistic_vgg16 = joblib.load('logistic_vgg16.joblib')
-lgbm_vgg16 = joblib.load('lgbm_vgg16.joblib')
-nmf_vgg16 = joblib.load('nmf_vgg16.joblib')
-svm_mobilenet = joblib.load('svm_mobilenet.joblib')
-
-# Define the VGG16 model for feature extraction
-vgg16_base = VGG16(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
-vgg_feature_extractor = Model(inputs=vgg16_base.input, outputs=Flatten()(vgg16_base.output))
-
-# Define the MobileNet model for feature extraction
-mobilenet_base = MobileNet(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
-mobilenet_feature_extractor = Model(inputs=mobilenet_base.input, outputs=Flatten()(mobilenet_base.output))
-
-# Path to save the uploaded images
-UPLOAD_FOLDER = 'static/uploads/'
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-
-# Ensure the upload folder exists
-if not os.path.exists(UPLOAD_FOLDER):
-    os.makedirs(UPLOAD_FOLDER)
-
-# Function to process the image and make predictions
-def predict_image(image_path, algorithm):
-    # Load and preprocess the image
-    img = load_img(image_path, target_size=(224, 224))  # Ensure consistent image size
-    img_array = img_to_array(img)
-    img_array = np.expand_dims(img_array, axis=0)
-    img_array = preprocess_input(img_array)
-
-    if algorithm == 'vnl_net':
-        # Extract features using VGG16
-        vgg_features = vgg_feature_extractor.predict(img_array)
-        nmf_features = nmf_vgg16.transform(vgg_features)
-        enhanced_features = lgbm_vgg16.predict_proba(nmf_features)[:, 1].reshape(-1, 1)
-        pred = logistic_vgg16.predict(enhanced_features)
-    elif algorithm == 'mobilenet_svm':
-        # Extract features using MobileNet
-        mobilenet_features = mobilenet_feature_extractor.predict(img_array)
-        pred = svm_mobilenet.predict(mobilenet_features)
-    else:
-        return "Invalid Algorithm Selection"
-
-    # Return the class label
-    if pred == 1:
-        return "Normal Kid"
-    else:
-        return "Has a Down Syndrome"
-
-@app.route('/algorithm', methods=["GET", "POST"])
+@app.route("/algorithm", methods=["GET", "POST"])
 def algorithm():
     if request.method == "POST":
-        if 'file' not in request.files or 'algorithm' not in request.form:
-            return redirect(request.url)
-        file = request.files['file']
-        algorithm = request.form['algorithm']
-        if file.filename == '':
-            return redirect(request.url)
-        if file:
-            # Save the file securely
-            filename = secure_filename(file.filename)
-            file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            file.save(file_path)
+        file = request.files.get("file")
+        algorithm_name = request.form.get("algorithm", "")
 
-            # Predict the class using the selected algorithm
-            prediction = predict_image(file_path, algorithm)
+        if not file or not file.filename:
+            return render_template("algorithm.html", message="Please upload an image.")
 
-            # Pass the prediction and image to the frontend
-            return render_template('algorithm.html', prediction=prediction, image_name=filename)
+        filename = secure_filename(file.filename)
+        file_path = UPLOAD_FOLDER / filename
+        file.save(file_path)
 
-    return render_template('algorithm.html')
+        if algorithm_name != "vnl_net":
+            prediction = "Only vnl_net is available with the current repository assets."
+        else:
+            prediction = predictor.predict_vnl_net(file_path)
 
-@app.route('/prediction', methods=['GET', 'POST'])
+        return render_template(
+            "algorithm.html",
+            prediction=prediction,
+            image_name=filename,
+            model_error=predictor.model_error,
+        )
+
+    return render_template("algorithm.html", model_error=predictor.model_error)
+
+
+@app.route("/healthz")
+def healthz():
+    return {"status": "ok"}, 200
+
+
+@app.route("/prediction")
 def prediction():
-    return render_template('prediction.html')
+    return render_template("prediction.html")
 
 
-@app.route('/graph')
+@app.route("/graph")
 def graph():
-    return render_template('graph.html')
+    return render_template("graph.html")
 
 
-if __name__ == '__main__':
-    app.run(debug = True)
-    
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)

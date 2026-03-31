@@ -1,0 +1,17 @@
+{% extends 'base.html' %}
+{% block content %}
+<h2>Algorithm</h2>
+{% if message %}<p class="msg">{{ message }}</p>{% endif %}
+{% if model_error %}<p class="msg warn">Model warning: {{ model_error }}</p>{% endif %}
+<form method="post" enctype="multipart/form-data">
+  <input type="file" name="file" accept="image/*" required><br>
+  <select name="algorithm">
+    <option value="vnl_net">VNL Net (VGG16 feature pipeline)</option>
+  </select><br>
+  <button type="submit">Predict</button>
+</form>
+{% if prediction %}
+  <h3>Result: {{ prediction }}</h3>
+  {% if image_name %}<img src="{{ url_for('static', filename='uploads/' + image_name) }}" alt="uploaded" width="280">{% endif %}
+{% endif %}
+{% endblock %}
